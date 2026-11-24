@@ -8940,5 +8940,294 @@ print(cek_palindrom("Kasur Rusak"))  # Output saat ini: False (BUG!)</code></pre
     // =========================================================================
     renderApp();
   </script>
+  <!-- =====================================================================
+       TRITAS GAS SYNC — sinkronisasi Google Apps Script (local-first)
+       - UI tetap memakai data lokal (instan, TANPA layar loading)
+       - Sinkron di latar belakang, per-record, hanya yang berubah
+       - Semua dibungkus try/catch: gagal koneksi = diam, aplikasi tetap jalan
+       ===================================================================== -->
+  <script>
+  (function () {
+    'use strict';
+
+    // >>> ISI DI SINI (atau panggil TritasSync.setUrl('URL','KUNCI') dari Console) <<<
+    var GAS_URL = 'https://script.google.com/macros/s/AKfycbzHI3_TIphVYghNCeVFBuT7CjZhm2xizAF77onXVHd7n43A5-YRlRTc4sjyI-5qlwsi/exec';   // contoh: 'https://script.google.com/macros/s/AKfycb.../exec'
+    var GAS_KEY = '';   // samakan dengan SECRET di Code.gs (kosongkan jika SECRET kosong)
+
+    var LS_URL = 'tritas_gas_url', LS_KEY = 'tritas_gas_key', LS_META = 'tritas_gas_meta_v1';
+    try { GAS_URL = localStorage.getItem(LS_URL) || GAS_URL; GAS_KEY = localStorage.getItem(LS_KEY) || GAS_KEY; } catch (e) {}
+
+    var ARR = ['students', 'schedules', 'rooms', 'staffAccounts', 'examPackages', 'questions'];
+    var KV  = ['schoolInfo', 'examConfig', 'lastBackupAt'];
+
+    var meta = { cursor: 0, h: {}, a: {} };
+    try { var m0 = JSON.parse(localStorage.getItem(LS_META) || 'null'); if (m0 && m0.h) meta = m0; } catch (e) {}
+    if (!meta.h) meta.h = {}; if (!meta.a) meta.a = {};
+    function saveMeta() { try { localStorage.setItem(LS_META, JSON.stringify(meta)); } catch (e) {} }
+
+    var rep = function (k, v) { return k === 'rt' ? undefined : v; };
+    function hash(s) { var h = 5381, i = s.length; while (i) h = (h * 33) ^ s.charCodeAt(--i); return (h >>> 0).toString(36) + '.' + s.length; }
+    function hs(o) { return hash(JSON.stringify(o, rep) || ''); }
+    function enabled() { return !!GAS_URL; }
+    function S() { try { return state; } catch (e) { return null; } }
+    function examLive() { var s = S(); return !!(s && s.studentSession && s.studentSession.step === 'exam' && s.currentRole === 'siswa'); }
+    function auditId(e) { return [e.ts, e.actor, e.action, e.target].join('|'); }
+
+    // ---------- jaringan ----------
+    function post(body) {
+      body.key = GAS_KEY;
+      var ctl = (typeof AbortController !== 'undefined') ? new AbortController() : null;
+      var t = setTimeout(function () { if (ctl) ctl.abort(); }, 28000);
+      return fetch(GAS_URL, {
+        method: 'POST', redirect: 'follow',
+        headers: { 'Content-Type': 'text/plain;charset=utf-8' },
+        body: JSON.stringify(body, rep), signal: ctl ? ctl.signal : undefined
+      }).then(function (r) { return r.json(); })
+        .then(function (j) { clearTimeout(t); return j; }, function (e) { clearTimeout(t); throw e; });
+    }
+
+    // ---------- DIFF (lokal -> server) ----------
+    function buildDiff() {
+      var s = S(), items = [];
+      if (!s) return items;
+      ARR.forEach(function (c) {
+        var cur = Array.isArray(s[c]) ? s[c] : [], mh = meta.h[c] || {}, seen = {}, dels = [];
+        cur.forEach(function (rec) {
+          if (!rec || rec.id === undefined || rec.id === null || rec.id === '') return;
+          var id = String(rec.id); seen[id] = 1;
+          var h = hs(rec);
+          if (mh[id] !== h) items.push({ c: c, id: id, h: h, data: rec });
+        });
+        Object.keys(mh).forEach(function (id) { if (!seen[id]) dels.push(id); });
+        // Pengaman: jangan hapus massal jika data lokal terlihat kosong/rusak
+        var known = Object.keys(mh).length;
+        if (dels.length && !(cur.length === 0 && known > 0) && !(dels.length > 20 && dels.length > known / 2)) {
+          dels.forEach(function (id) { items.push({ c: c, id: id, deleted: true }); });
+        }
+      });
+      KV.forEach(function (k) {
+        var mh = meta.h.kv || {}, v = { v: s[k] === undefined ? null : s[k] }, h = hs(v);
+        if (mh[k] !== h) items.push({ c: 'kv', id: k, h: h, data: v });
+      });
+      (Array.isArray(s.auditLog) ? s.auditLog : []).forEach(function (e) {
+        var id = auditId(e);
+        if (!meta.a[id]) items.push({ c: 'audit', id: id, a: 1, data: e });
+      });
+      return items;
+    }
+
+    function batches(items) {
+      var out = [], cur = [], size = 0;
+      items.forEach(function (it) {
+        var n = it.data ? (JSON.stringify(it.data, rep) || '').length : 20;
+        if (cur.length && (size + n > 700000 || cur.length >= 150)) { out.push(cur); cur = []; size = 0; }
+        cur.push(it); size += n;
+      });
+      if (cur.length) out.push(cur);
+      return out;
+    }
+
+    function pushAll() {
+      var items = buildDiff();
+      if (!items.length) return Promise.resolve(0);
+      var bs = batches(items), total = 0;
+      return bs.reduce(function (p, batch) {
+        return p.then(function () {
+          var ch = {};
+          batch.forEach(function (it) {
+            (ch[it.c] = ch[it.c] || []).push(it.deleted ? { id: it.id, deleted: true } : { id: it.id, data: it.data });
+          });
+          return post({ action: 'push', changes: ch }).then(function (r) {
+            if (!r || !r.ok) throw new Error((r && r.error) || 'push gagal');
+            batch.forEach(function (it) {
+              if (it.c === 'audit') { meta.a[it.id] = 1; return; }
+              meta.h[it.c] = meta.h[it.c] || {};
+              if (it.deleted) delete meta.h[it.c][it.id]; else meta.h[it.c][it.id] = it.h;
+            });
+            if (r.cursor && r.cursor > meta.cursor) { /* cursor diambil dari pull berikutnya */ }
+            total += batch.length; saveMeta();
+          });
+        });
+      }, Promise.resolve()).then(function () { return total; });
+    }
+
+    // ---------- APPLY (server -> lokal) ----------
+    function applyRemote(changes) {
+      var s = S(); if (!s || !changes) return false;
+      var changed = false, ownId = examLive() ? s.studentSession.studentId : null;
+
+      ARR.forEach(function (c) {
+        var list = changes[c]; if (!list || !list.length) return;
+        if (!Array.isArray(s[c])) s[c] = [];
+        meta.h[c] = meta.h[c] || {};
+        var mh = meta.h[c], idx = {};
+        s[c].forEach(function (r, i) { if (r && r.id !== undefined) idx[String(r.id)] = i; });
+        var removeIds = {};
+        list.forEach(function (rm) {
+          var id = String(rm.id), i = idx[id], local = (i !== undefined) ? s[c][i] : null;
+          if (c === 'students' && ownId && id === ownId) return;           // jangan timpa jawaban yang sedang dikerjakan
+          var localModified = local && mh[id] !== undefined && hs(local) !== mh[id];
+          if (localModified) return;                                        // perubahan lokal menang, akan di-push
+          if (rm.deleted) {
+            if (local) { removeIds[id] = 1; changed = true; }
+            delete mh[id];
+          } else if (rm.data) {
+            if (local && hs(local) === hs(rm.data)) { mh[id] = hs(rm.data); return; }
+            if (local) s[c][i] = rm.data; else { s[c].push(rm.data); idx[id] = s[c].length - 1; }
+            mh[id] = hs(rm.data); changed = true;
+          }
+        });
+        if (Object.keys(removeIds).length) s[c] = s[c].filter(function (r) { return !(r && removeIds[String(r.id)]); });
+      });
+
+      if (changes.kv && changes.kv.length) {
+        meta.h.kv = meta.h.kv || {};
+        changes.kv.forEach(function (rm) {
+          if (rm.deleted || !rm.data || KV.indexOf(rm.id) < 0) return;
+          var cur = { v: s[rm.id] === undefined ? null : s[rm.id] };
+          var localModified = meta.h.kv[rm.id] !== undefined && hs(cur) !== meta.h.kv[rm.id];
+          if (localModified) return;
+          if (hs(cur) !== hs(rm.data)) { s[rm.id] = rm.data.v; changed = true; }
+          meta.h.kv[rm.id] = hs(rm.data);
+        });
+      }
+
+      if (changes.audit && changes.audit.length) {
+        var have = {}; (s.auditLog || []).forEach(function (e) { have[auditId(e)] = 1; });
+        changes.audit.forEach(function (rm) {
+          if (!rm.data) return;
+          meta.a[rm.id] = 1;
+          if (!have[rm.id]) { s.auditLog.push(rm.data); changed = true; }
+        });
+        s.auditLog.sort(function (a, b) { return (b.ts || 0) - (a.ts || 0); });
+        if (s.auditLog.length > 500) s.auditLog.length = 500;
+        try { localStorage.setItem('tritas_cbt_audit_v2', JSON.stringify(s.auditLog)); } catch (e) {}
+      }
+
+      if (changed) {
+        try { if (typeof sortStudentsByName === 'function') s.students = sortStudentsByName(s.students); } catch (e) {}
+        try { pxSaveImmediate(); } catch (e) {}
+      }
+      return changed;
+    }
+
+    function safeRender() {
+      try {
+        if (examLive()) return;
+        var ae = document.activeElement;
+        if (ae && /^(INPUT|TEXTAREA|SELECT)$/.test(ae.tagName)) return;
+        var mb = document.getElementById('modal-backdrop');
+        if (mb && !mb.classList.contains('hidden')) return;
+        if (typeof renderApp === 'function') renderApp();
+      } catch (e) {}
+    }
+
+    function pullAll() {
+      return post({ action: 'pull', since: meta.cursor }).then(function (r) {
+        if (!r || !r.ok) throw new Error((r && r.error) || 'pull gagal');
+        var changed = r.empty ? false : applyRemote(r.changes);
+        if (typeof r.cursor === 'number' && r.cursor >= meta.cursor) meta.cursor = r.cursor;
+        saveMeta();
+        if (changed) safeRender();
+        return changed;
+      });
+    }
+
+    // ---------- penjadwal ----------
+    var busy = false, dirty = false, pushT = 0, lastRun = 0, fails = 0, lastOk = 0, lastErr = '';
+
+    function stamp() {
+      try { S().lastSyncedAt = new Date().toLocaleTimeString('id-ID', { hour: '2-digit', minute: '2-digit', second: '2-digit' }); } catch (e) {}
+    }
+
+    function syncNow() {
+      if (!enabled() || (typeof navigator !== 'undefined' && navigator.onLine === false)) return Promise.resolve();
+      if (busy) { dirty = true; return Promise.resolve(); }
+      busy = true; lastRun = Date.now();
+      var p = Promise.resolve();
+      if (!examLive()) p = p.then(pullAll);            // saat ujian: hanya kirim, tidak menarik
+      return p.then(pushAll).then(function () {
+        fails = 0; lastOk = Date.now(); lastErr = ''; stamp();
+      }).catch(function (e) {
+        fails++; lastErr = String(e && e.message || e);
+        clearTimeout(pushT); pushT = setTimeout(syncNow, Math.min(60000, 4000 * fails));
+      }).then(function () {
+        busy = false;
+        if (dirty) { dirty = false; schedulePush(); }
+      });
+    }
+
+    function schedulePush() {
+      if (!enabled()) return;
+      clearTimeout(pushT);
+      pushT = setTimeout(syncNow, 1800);
+    }
+
+    // ---------- kait (hook) ke fungsi simpan aplikasi ----------
+    try {
+      var origSave = window.pxSave;
+      if (typeof origSave === 'function') {
+        window.pxSave = function () { var r = origSave.apply(this, arguments); schedulePush(); return r; };
+      }
+      var origLog = window.pxLog;
+      if (typeof origLog === 'function') {
+        window.pxLog = function () { var r = origLog.apply(this, arguments); schedulePush(); return r; };
+      }
+      var origReset = window.executeFactoryReset;
+      if (typeof origReset === 'function') {
+        window.executeFactoryReset = function () {
+          try { localStorage.removeItem(LS_META); } catch (e) {}
+          return origReset.apply(this, arguments);
+        };
+      }
+    } catch (e) {}
+
+    // Polling ringan: admin/guru 15 dtk, siswa 60 dtk (respons server instan bila tak ada perubahan)
+    setInterval(function () {
+      if (!enabled() || document.hidden || busy) return;
+      var s = S(), every = (s && s.currentRole === 'siswa') ? 60000 : 15000;
+      if (Date.now() - lastRun >= every) syncNow();
+    }, 5000);
+
+    window.addEventListener('online', function () { syncNow(); });
+    document.addEventListener('visibilitychange', function () {
+      if (!document.hidden) syncNow();
+      else if (enabled()) flushBeacon();
+    });
+    window.addEventListener('pagehide', function () { if (enabled()) flushBeacon(); });
+
+    // Kirim sisa perubahan saat tab ditutup (mis. siswa menutup browser setelah submit)
+    function flushBeacon() {
+      try {
+        if (!navigator.sendBeacon) return;
+        var items = buildDiff().filter(function (i) { return !i.deleted; });
+        if (!items.length) return;
+        var ch = {}, size = 0;
+        for (var i = 0; i < items.length; i++) {
+          var n = (JSON.stringify(items[i].data, rep) || '').length;
+          if (size + n > 55000) break;
+          size += n; (ch[items[i].c] = ch[items[i].c] || []).push({ id: items[i].id, data: items[i].data });
+        }
+        if (!size) return;
+        navigator.sendBeacon(GAS_URL, new Blob([JSON.stringify({ action: 'push', key: GAS_KEY, changes: ch }, rep)], { type: 'text/plain;charset=utf-8' }));
+      } catch (e) {}
+    }
+
+    // ---------- API untuk Console ----------
+    window.TritasSync = {
+      now: syncNow,
+      status: function () { return { aktif: enabled(), sibuk: busy, cursor: meta.cursor, sukses_terakhir: lastOk ? new Date(lastOk).toLocaleString('id-ID') : '-', galat_terakhir: lastErr || '-', antrean: enabled() ? buildDiff().length : 0 }; },
+      setUrl: function (url, key) {
+        try { localStorage.setItem(LS_URL, url || ''); localStorage.setItem(LS_KEY, key || ''); } catch (e) {}
+        GAS_URL = url || ''; GAS_KEY = key || ''; meta = { cursor: 0, h: {}, a: {} }; saveMeta(); return syncNow();
+      },
+      resetLokalMeta: function () { meta = { cursor: 0, h: {}, a: {} }; saveMeta(); },
+      resetServer: function () { return post({ action: 'reset' }); }
+    };
+
+    // Mulai di latar belakang setelah UI tampil
+    if (enabled()) setTimeout(syncNow, 400);
+  })();
+  </script>
 </body>
 </html>
